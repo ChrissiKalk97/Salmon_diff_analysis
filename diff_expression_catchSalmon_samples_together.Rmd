@@ -1,0 +1,601 @@
+---
+title: "differential_expression_analysis_salmon"
+output: pdf_document
+date: "2024-01-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+```{r imports, include=FALSE}
+#BiocManager::install("edgeR")
+library(edgeR)
+library(tximport)
+library(stringr)
+library(tidyverse)
+#BiocManager::install("GenomicFeatures")
+library(GenomicFeatures)
+```
+
+specify files:
+```{r}
+get_name <- function(filename){
+  new_name <- paste("align_reps_salmon_boostrap", filename, sep = "/")
+  return(new_name)
+}
+```
+
+specify files:
+```{r}
+create_filename <- function(filename){
+ new_name <- str_split_1(filename, "_")[1]
+  return(new_name)
+}
+```
+
+```{r}
+setwd("/Users/christina/Documents/Salmon")
+sample_id <- lapply(list.files("align_reps_salmon_boostrap"), create_filename)
+sample_id <- unlist(sample_id)
+sample_id
+``` 
+
+```{r}
+conditions <- c("control1", "UPF1_KD", "UPF1_rescue", "SMG6_KD", "SMG6_rescue", "control2", "SMG7_KD", "SMG7_rescue", "dKD", "dKD_SMG6_rescue", "dKD_SMG7_rescue")
+conditions <- lapply(conditions, function(x) rep(x, 3))
+conditions <- unlist(conditions)
+conditions
+```
+
+
+
+
+```{r}
+files <- lapply(list.files("/Users/christina/Documents/Salmon/align_reps_salmon_boostrap"), get_name)
+files <- unlist(files)
+names(files) <- sample_id
+#files_a <- files[1:15]#batch A
+#files_b <- files[16:length(files)]#batch B
+```
+
+
+## Load gene to transcript mapping from database
+```{r}
+#gtf <- "merged_mixed_transcriptome_gtf_gene_id_filtered.gtf"
+txdb.filename <- "transcriptome_gtf.sqlite"
+#txdb <- makeTxDbFromGFF(gtf)
+#saveDb(txdb, txdb.filename)
+```
+
+```{r}
+txdb <- loadDb(txdb.filename)
+txdf <- select(txdb, keys(txdb, "GENEID"), "TXNAME", "GENEID")
+tab <- table(txdf$GENEID)
+txdf$ntx <- tab[match(txdf$GENEID, names(tab))]
+```
+
+## NMD transcript IDs: for comparison
+```{r}
+library(stringr)
+con <- file("/Users/christina/Documents/ExtendedSplitORFPipeline-master_13_11_23/Input2023/NMD_transcripts_CDNA.fa")
+data <- readLines(con = con)
+close(con)
+IDs <- str_extract(data,"(?>ENSG.+\\|)[[:alnum:]]+")
+IDs <- IDs[!is.na(IDs)]
+ID_list <- unlist(str_split(IDs, pattern = "\\|"))
+NMD_transcript_IDs <- ID_list[c(FALSE, TRUE)] 
+#write.table(data.frame(IDs),file="IDs.txt",row.names = FALSE, col.names=FALSE, quote = FALSE)
+```
+
+# Load data: CatchSalmon to obtain dispersion estimates, divide by dispersion estimates
+```{r}
+catchSalmon_counts <- catchSalmon(files)#get overdispersion estimates of batch A
+y <- DGEList(counts=catchSalmon_counts$counts/catchSalmon_counts$annotation$Overdispersion, genes=catchSalmon_counts$annotation, group = conditions)
+```
+# Differential expression of transcripts in 2 batches
+
+```{r}
+keep <- filterByExpr(y)
+y <- y[keep,,keep.lib.sizes=FALSE]
+y <- normLibSizes(y)
+y <- calcNormFactors(y)
+design <- model.matrix(~y$samples$group)
+colnames(design) <- levels(c)
+y <- estimateDisp(y,design)
+```
+
+```{r}
+plotBCV(y)
+```
+
+```{r}
+plotMDS(y, label = y$samples$group)
+```
+# Function and Prepartions for analysis
+
+```{r}
+#dataframe to store the results
+sample_summary<- data.frame(matrix(ncol=7,nrow=4, dimnames=list(c("Up", "Down", "in_common", "Insign"), c("Nr Trans", "Nr Genes", "FC1_2", "FC1_5", "FC2", "NMD", "MST"))))
+```
+
+```{r}
+get_significant_transcripts <- function(qlf, sample_summary, NMD_transcripts){
+  qlf$table$FDR <- p.adjust(qlf$table$PValue, method="BH")
+  sign_transcripts <- qlf$table[qlf$table$FDR < 0.05, ]
+  sign_transcripts$TXNAME = rownames(sign_transcripts)
+  merged_df <- merge(sign_transcripts, txdf[,c("GENEID", "TXNAME")], by = "TXNAME")
+  sign_transcripts_up <- merged_df[merged_df$logFC > 0, ]
+  sign_transcripts_down <-  merged_df[merged_df$logFC < 0, ]
+  insign_tr <- qlf$table[qlf$table$FDR >= 0.05, ]
+  insign_tr ["TXNAME"] = rownames(insign_tr)
+  insign_tr <- merge(insign_tr,  txdf[,c("GENEID", "TXNAME")], by = "TXNAME")
+  
+  
+  
+  #Number of transcripts
+  sample_summary[1,1] = length(rownames(sign_transcripts_up))
+  sample_summary[2,1] = length(rownames(sign_transcripts_down)) 
+  sample_summary[3,1] = sum(rownames(sign_transcripts_down) %in% rownames(sign_transcripts_up))
+  sample_summary[4,1] = length(rownames(insign_tr))
+  
+  #Genes
+  sample_summary[1,2] = length(unique(sign_transcripts_up$GENEID))
+  sample_summary[2,2] = length(unique(sign_transcripts_down$GENEID))
+  sample_summary[3,2] = sum(sign_transcripts_up$GENEID %in% sign_transcripts_down$GENEID)
+  sample_summary[4,2] = length(unique(insign_tr$GENEID))
+  
+  #NMD transcripts
+  sample_summary[4,6] = sum(insign_tr$TXNAME %in% NMD_transcript_IDs)
+  sample_summary[1,6] = sum(sign_transcripts_up$TXNAME %in% NMD_transcript_IDs)
+  sample_summary[2,6] = sum(sign_transcripts_down$TXNAME %in% NMD_transcript_IDs)
+  sample_summary[3,6] = sum((sign_transcripts_down$TXNAME %in% NMD_transcript_IDs) %in%  sign_transcripts_up$TXNAME)
+  
+  
+  #FC
+  sign_transcripts_up_1_2 <- merged_df[merged_df$logFC > 0.26303440583379, ]
+  sample_summary[1,3] = length(rownames(sign_transcripts_up_1_2))
+  sign_transcripts_up_1_5 <- merged_df[merged_df$logFC > 0.58496250072116, ]
+  sample_summary[1,4] = length(rownames(sign_transcripts_up_1_5))
+  sign_transcripts_up_2 <- merged_df[merged_df$logFC > 1, ]
+  sample_summary[1,5] = length(rownames(sign_transcripts_up_2))
+  
+  #MST
+  counter = 0
+  for (txid in sign_transcripts_up$TXNAME){
+    if (startsWith(txid, "MST")){
+      counter = counter + 1
+    }
+  }
+  sample_summary[1,7] = counter
+  
+  counter = 0
+  for (txid in sign_transcripts_down$TXNAME){
+    if (startsWith(txid, "MST")){
+      counter = counter + 1
+    }
+  }
+  sample_summary[2,7] = counter
+  
+  counter = 0
+  for (txid in insign_tr$TXNAME){
+    if (startsWith(txid, "MST")){
+      counter = counter + 1
+    }
+  }
+  sample_summary[4,7] = counter
+  
+  #return
+  significant_transcripts <- list("total" = merged_df, "up" = sign_transcripts_up, "down" = sign_transcripts_down, "table" = sample_summary)
+  
+  return(significant_transcripts)
+}
+```
+
+
+
+
+
+
+# Analysis
+
+## SMG6_KD versus control
+
+```{r}
+#Fit model
+fit <- glmQLFit(y,design)
+qlf <- glmQLFTest(fit,coef=6)
+```
+
+
+```{r}
+significant_transcripts <- get_significant_transcripts(qlf, sample_summary, NMD_transcripts)
+sign_transcripts <- significant_transcripts$total
+sign_transcripts_up <- significant_transcripts$up
+sign_transcripts_down <- significant_transcripts$down
+significant_transcripts$table
+```
+
+
+```{r}
+SMG6_KD_up <- sign_transcripts_up$TXNAME
+```
+
+```{r}
+plotQLDisp(fit)
+```
+
+
+```{r}
+plotMD(qlf)
+```
+```{r}
+summary(decideTests(qlf))
+```
+
+
+```{r}
+#check expression of NMD transcripts in control
+mean(y$counts[rownames(y$counts[, 1:3]) %in% NMD_transcript_IDs, 1:3])
+
+insign_NMD <- rownames(insign_tr)[rownames(insign_tr) %in% NMD_transcript_IDs]
+
+mean(y$counts[rownames(y$counts[, 1:3]) %in% insign_NMD, 1:3])
+
+NMD_up <- sign_transcripts_up$TXNAME[sign_transcripts_up$TXNAME %in% NMD_transcript_IDs]
+NMD_down <- sign_transcripts_down$TXNAME[sign_transcripts_down$TXNAME %in% NMD_transcript_IDs]
+
+
+mean(y$counts[rownames(y$counts[, 1:3]) %in% NMD_up, 1:3])
+mean(y$counts[rownames(y$counts[, 1:3]) %in% NMD_down, 1:3])
+```
+
+##  SMG6 KD versus rescue
+
+```{r}
+fit <- glmQLFit(y,design)
+qlf <- glmQLFTest(fit,contrast= c(0, 0, 0, 0, 0, 1, -1, 0, 0, 0, 0))
+```
+
+```{r}
+plotMD(qlf)
+```
+```{r}
+significant_transcripts <- get_significant_transcripts(qlf, sample_summary, NMD_transcripts)
+sign_transcripts <- significant_transcripts$total
+sign_transcripts_up <- significant_transcripts$up
+sign_transcripts_down <- significant_transcripts$down
+significant_transcripts$table
+```
+
+
+```{r}
+summary(decideTests(qlf))
+```
+
+
+
+
+```{r}
+#check expression of NMD transcripts in control
+mean(y$counts[rownames(y$counts[, 1:3]) %in% NMD_transcript_IDs, 1:3])
+
+insign_NMD <- rownames(insign_tr)[rownames(insign_tr) %in% NMD_transcript_IDs]
+
+mean(y$counts[rownames(y$counts[, 1:3]) %in% insign_NMD, 1:3])
+
+NMD_up <- sign_transcripts_up$TXNAME[sign_transcripts_up$TXNAME %in% NMD_transcript_IDs]
+NMD_down <- sign_transcripts_down$TXNAME[sign_transcripts_down$TXNAME %in% NMD_transcript_IDs]
+
+
+mean(y$counts[rownames(y$counts[, 1:3]) %in% NMD_up, 1:3])
+mean(y$counts[rownames(y$counts[, 1:3]) %in% NMD_down, 1:3])
+```
+
+
+## UPF1 KD against control
+
+
+```{r}
+fit <- glmQLFit(y,design)
+qlf <- glmQLFTest(fit,coef=10)
+```
+
+```{r}
+significant_transcripts <- get_significant_transcripts(qlf, sample_summary, NMD_transcripts)
+sign_transcripts <- significant_transcripts$total
+sign_transcripts_up <- significant_transcripts$up
+sign_transcripts_down <- significant_transcripts$down
+significant_transcripts$table
+```
+
+```{r}
+plotMD(qlf)
+```
+
+
+```{r}
+UPF1_KD_up <- sign_transcripts_up$TXNAME
+```
+
+```{r}
+summary(decideTests(qlf))
+```
+
+
+## UPF1KD against rescue
+```{r}
+fit <- glmQLFit(y,design)
+qlf <- glmQLFTest(fit,contrast= c(0, 0, 0, 0, 0, 0, 0, 0, 0, 1, -1))
+```
+
+```{r}
+significant_transcripts <- get_significant_transcripts(qlf, sample_summary, NMD_transcripts)
+sign_transcripts <- significant_transcripts$total
+sign_transcripts_up <- significant_transcripts$up
+sign_transcripts_down <- significant_transcripts$down
+significant_transcripts$table
+```
+
+```{r}
+plotMD(qlf)
+```
+
+
+```{r}
+summary(decideTests(qlf))
+```
+
+
+
+
+## DKD agaisnt control
+
+```{r}
+#test control 2 against the double knockdown
+fit <- glmQLFit(y,design)
+qlf <- glmQLFTest(fit,contrast= c(0, -1, 1, 0, 0, 0, 0, 0, 0, 0, 0))
+```
+
+
+```{r}
+significant_transcripts <- get_significant_transcripts(qlf, sample_summary, NMD_transcripts)
+sign_transcripts <- significant_transcripts$total
+sign_transcripts_up <- significant_transcripts$up
+sign_transcripts_down <- significant_transcripts$down
+significant_transcripts$table
+```
+
+
+```{r}
+plotMD(qlf)
+```
+
+
+
+```{r}
+dKD_up <- sign_transcripts_up$TXNAME
+```
+
+```{r}
+summary(decideTests(qlf))
+```
+
+# double knockdown against SMG6 rescue
+
+```{r}
+#test SMG6 rescue against double KD
+fit <- glmQLFit(y,design)
+qlf <- glmQLFTest(fit,contrast= c(0, 0, 1, -1, 0, 0, 0, 0, 0, 0, 0))
+```
+
+```{r}
+significant_transcripts <- get_significant_transcripts(qlf, sample_summary, NMD_transcripts)
+sign_transcripts <- significant_transcripts$total
+sign_transcripts_up <- significant_transcripts$up
+sign_transcripts_down <- significant_transcripts$down
+significant_transcripts$table
+```
+
+```{r}
+plotMD(qlf)
+```
+
+
+
+```{r}
+dKD_SMG6_rescue_up <- sign_transcripts_up$TXNAME
+```
+
+
+
+```{r}
+summary(decideTests(qlf))
+```
+
+
+## DKD against SMG7 rescue
+```{r}
+#test SMG7 rescue against doble KD
+fit <- glmQLFit(y,design)
+qlf <- glmQLFTest(fit,contrast= c(0, 0, 1, 0, -1, 0, 0, 0, 0, 0, 0))
+```
+
+```{r}
+significant_transcripts <- get_significant_transcripts(qlf, sample_summary, NMD_transcripts)
+sign_transcripts <- significant_transcripts$total
+sign_transcripts_up <- significant_transcripts$up
+sign_transcripts_down <- significant_transcripts$down
+significant_transcripts$table
+```
+
+
+```{r}
+plotMD(qlf)
+```
+
+```{r}
+summary(decideTests(qlf))
+```
+
+## SMG7 KD against control
+```{r}
+#test control 2 against the SMG7 KD
+fit <- glmQLFit(y,design)
+qlf <- glmQLFTest(fit,contrast= c(0, -1, 0, 0, 0, 0, 0, 1, 0, 0, 0))
+```
+
+```{r}
+significant_transcripts <- get_significant_transcripts(qlf, sample_summary, NMD_transcripts)
+sign_transcripts <- significant_transcripts$total
+sign_transcripts_up <- significant_transcripts$up
+sign_transcripts_down <- significant_transcripts$down
+significant_transcripts$table
+```
+
+```{r}
+plotMD(qlf)
+```
+
+
+
+```{r}
+KD_SMG7 <- sign_transcripts_up$TXNAME
+```
+
+
+
+```{r}
+summary(decideTests(qlf))
+```
+
+
+
+## SMG7 rescue against SMG7 KD
+```{r}
+#test SMG7 rescue against SMG7 KD
+fit <- glmQLFit(y,design)
+qlf <- glmQLFTest(fit,contrast= c(0, 0, 0, 0, 0, 0, 0, 1, -1, 0, 0))
+```
+
+```{r}
+significant_transcripts <- get_significant_transcripts(qlf, sample_summary, NMD_transcripts)
+sign_transcripts <- significant_transcripts$total
+sign_transcripts_up <- significant_transcripts$up
+sign_transcripts_down <- significant_transcripts$down
+significant_transcripts$table
+```
+
+```{r}
+plotMD(qlf)
+```
+
+```{r}
+summary(decideTests(qlf))
+```
+
+# Intersection and union
+
+## Check intersection of UPF1_KD and SMG6_KD
+
+```{r}
+length(SMG6_KD_up)
+length(UPF1_KD_up)
+intersection <- SMG6_KD_up[SMG6_KD_up %in% UPF1_KD_up]
+length(intersection)
+```
+
+```{r}
+length(intersection[intersection %in% NMD_transcript_IDs])
+```
+
+```{r}
+counter = 0
+for (txid in intersection){
+  if (startsWith(txid, "MST")){
+    counter = counter + 1
+  }
+}
+print(counter)
+```
+
+## Intersection dKD and SMG7
+```{r}
+batch_b_intersect <- dKD_up[dKD_up %in% KD_SMG7]
+length(batch_b_intersect)
+sum(batch_b_intersect %in% NMD_transcript_IDs)
+```
+
+
+```{r}
+total_intersect <- batch_b_intersect[batch_b_intersect %in% intersection]
+length(total_intersect)
+length(intersection)
+```
+
+
+```{r}
+sum(total_intersect %in% NMD_transcript_IDs)
+```
+
+```{r}
+union <- c(SMG6_KD_up, UPF1_KD_up, dKD_up, KD_SMG7)
+length(unique(union))
+```
+
+```{r}
+length(intersection[intersection %in% NMD_transcript_IDs])
+```
+
+```{r}
+counter = 0
+for (txid in total_intersect){
+  if (startsWith(txid, "MST")){
+    counter = counter + 1
+  }
+}
+print(counter)
+```
+
+```{r}
+counter = 0
+for (txid in union){
+  if (startsWith(txid, "MST")){
+    counter = counter + 1
+  }
+}
+print(counter)
+```
+
+```{r}
+length(union[union %in% NMD_transcript_IDs])
+```
+## SMG intersection
+```{r}
+sum(SMG6_KD_up[SMG6_KD_up %in% dKD_up] %in% KD_SMG7)
+```
+
+```{r}
+SMG_KD <- unique(c(KD_SMG7[KD_SMG7 %in% dKD_up], SMG6_KD_up[SMG6_KD_up %in% dKD_up]))
+```
+
+```{r}
+SMG_UPF_intersection<- SMG_KD[SMG_KD %in% UPF1_KD_up]
+length(SMG_KD[SMG_KD %in% UPF1_KD_up])
+```
+
+```{r}
+length(SMG_UPF_intersection[SMG_UPF_intersection %in% NMD_transcript_IDs])
+```
+
+```{r}
+counter = 0
+for (txid in SMG_UPF_intersection){
+  if (startsWith(txid, "MST")){
+    counter = counter + 1
+  }
+}
+print(counter)
+```
